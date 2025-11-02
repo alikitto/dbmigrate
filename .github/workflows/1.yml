@@ -1,0 +1,43 @@
+name: Migrate Railway → Supabase
+on: workflow_dispatch
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check secrets
+        run: |
+          if [ -z "${{ secrets.RAILWAY_DB_URL }}" ]; then
+            echo "RAILWAY_DB_URL is empty"; exit 1; fi
+          if [ -z "${{ secrets.SUPABASE_DB_URL }}" ]; then
+            echo "SUPABASE_DB_URL is empty"; exit 1; fi
+          echo "Secrets look OK."
+
+      - name: Dump from Railway
+        env:
+          RAILWAY_DB_URL: ${{ secrets.RAILWAY_DB_URL }}
+        run: |
+          set -euxo pipefail
+          mkdir -p dumps
+          docker run --rm -v "$PWD/dumps:/dumps" postgres:16 \
+            pg_dump --dbname="$RAILWAY_DB_URL" \
+                    --format=custom --no-owner --no-privileges \
+                    --quote-all-identifiers \
+                    --file=/dumps/railway.dump
+          ls -lh dumps
+
+      - name: Upload dump artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: railway.dump
+          path: dumps/railway.dump
+
+      - name: Restore to Supabase (Direct)
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -euxo pipefail
+          docker run --rm -v "$PWD/dumps:/dumps" postgres:16 \
+            pg_restore --dbname="$SUPABASE_DB_URL" \
+                       --no-owner --no-privileges --jobs=4 \
+                       /dumps/railway.dump
