@@ -1,0 +1,110 @@
+name: Migrate Railway to Supabase
+on:
+  workflow_dispatch:
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check secrets
+        env:
+          RAILWAY_DB_URL: ${{ secrets.RAILWAY_DB_URL }}
+          SUPABASE_POOLED_URL: ${{ secrets.SUPABASE_POOLED_URL }}
+        run: |
+          set -e
+          [ -z "$RAILWAY_DB_URL" ] && echo "RAILWAY_DB_URL empty" && exit 1
+          [ -z "$SUPABASE_POOLED_URL" ] && echo "SUPABASE_POOLED_URL empty" && exit 1
+          echo "Secrets OK"
+
+      # --- SCHEMA ---
+      - name: Dump SCHEMA from Railway
+        env:
+          RAILWAY_DB_URL: ${{ secrets.RAILWAY_DB_URL }}
+        run: |
+          set -euxo pipefail
+          mkdir -p dumps
+          docker run --rm -v "$PWD/dumps:/dumps" postgres:16 \
+            pg_dump "$RAILWAY_DB_URL" \
+              --schema-only --no-owner --no-privileges \
+              --quote-all-identifiers \
+              --file=/dumps/schema.sql
+          sed -i 's/\r$//' dumps/schema.sql || true
+
+      - name: Apply SCHEMA to Supabase
+        env:
+          SUPABASE_POOLED_URL: ${{ secrets.SUPABASE_POOLED_URL }}
+        run: |
+          set -euxo pipefail
+          docker run --rm -e SUPABASE_POOLED_URL="$SUPABASE_POOLED_URL" -v "$PWD/dumps:/dumps" postgres:16 \
+            bash -lc 'psql "$SUPABASE_POOLED_URL" -v ON_ERROR_STOP=0 -f /dumps/schema.sql'
+
+      - name: Ensure common extensions
+        env:
+          SUPABASE_POOLED_URL: ${{ secrets.SUPABASE_POOLED_URL }}
+        run: |
+          docker run --rm -e SUPABASE_POOLED_URL="$SUPABASE_POOLED_URL" postgres:16 \
+            psql "$SUPABASE_POOLED_URL" -v ON_ERROR_STOP=0 -c \
+            "create extension if not exists pgcrypto;
+             create extension if not exists \"uuid-ossp\";
+             create extension if not exists citext;
+             create extension if not exists pg_trgm;"
+
+      # --- DATA ---
+      - name: Dump DATA from Railway (public)
+        env:
+          RAILWAY_DB_URL: ${{ secrets.RAILWAY_DB_URL }}
+        run: |
+          set -euxo pipefail
+          docker run --rm -v "$PWD/dumps:/dumps" postgres:16 \
+            pg_dump "$RAILWAY_DB_URL" \
+              --data-only --inserts --no-owner --no-privileges \
+              --quote-all-identifiers \
+              --file=/dumps/data.sql
+          sed -i 's/\r$//' dumps/data.sql || true
+          ls -lh dumps/data.sql | cat
+
+      # список таблиц, которые чистим перед загрузкой (добавь сюда свои при нужде)
+      - name: Truncate target tables (avoid duplicates)
+        env:
+          SUPABASE_POOLED_URL: ${{ secrets.SUPABASE_POOLED_URL }}
+        run: |
+          set -euxo pipefail
+          docker run --rm -e SUPABASE_POOLED_URL="$SUPABASE_POOLED_URL" postgres:16 \
+            psql "$SUPABASE_POOLED_URL" -v ON_ERROR_STOP=1 -c \
+            'TRUNCATE TABLE public."avatar_settings", public."users" RESTART IDENTITY CASCADE;'
+
+      - name: Load DATA to Supabase
+        env:
+          SUPABASE_POOLED_URL: ${{ secrets.SUPABASE_POOLED_URL }}
+        run: |
+          set -euxo pipefail
+          docker run --rm -e SUPABASE_POOLED_URL="$SUPABASE_POOLED_URL" -v "$PWD/dumps:/dumps" postgres:16 \
+            bash -lc 'psql "$SUPABASE_POOLED_URL" -v ON_ERROR_STOP=1 -f /dumps/data.sql'
+
+      # --- RESET SEQUENCES (без DO $$, через \gexec) ---
+      - name: Fix sequences after import
+        env:
+          SUPABASE_POOLED_URL: ${{ secrets.SUPABASE_POOLED_URL }}
+        run: |
+          set -euxo pipefail
+          docker run --rm -e SUPABASE_POOLED_URL="$SUPABASE_POOLED_URL" postgres:16 \
+            bash -lc "cat <<'SQL' | psql \"$SUPABASE_POOLED_URL\" -v ON_ERROR_STOP=1
+          WITH seqs AS (
+            SELECT
+              format('%I.%I', n.nspname, c.relname) AS table_fq,
+              a.attname AS col,
+              pg_get_serial_sequence(format('%I.%I', n.nspname, c.relname), a.attname) AS seq
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid=c.relnamespace
+            JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0
+            WHERE n.nspname='public'
+              AND c.relkind='r'
+              AND pg_get_serial_sequence(format('%I.%I', n.nspname, c.relname), a.attname) IS NOT NULL
+          )
+          SELECT format(
+            'SELECT setval(%L, COALESCE((SELECT MAX(%I) FROM %s),1), true);',
+            seq, col, table_fq
+          )
+          FROM seqs;
+          \\gexec
+          SQL"
