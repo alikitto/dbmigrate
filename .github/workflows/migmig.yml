@@ -1,0 +1,66 @@
+name: Migrate Railway → Supabase
+on: workflow_dispatch
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      # 0) Проверяем, что секреты реально подхватились
+      - name: Check secrets
+        env:
+          RAILWAY_DB_URL: ${{ secrets.RAILWAY_DB_URL }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}          # Direct (db....supabase.co:5432)
+          SUPABASE_POOLED_URL: ${{ secrets.SUPABASE_POOLED_URL }}  # Pooler (....pooler.supabase.com:6543)
+        run: |
+          set -e
+          [ -z "$RAILWAY_DB_URL" ] && echo "RAILWAY_DB_URL is empty" && exit 1 || echo "RAILWAY_DB_URL OK"
+          [ -z "$SUPABASE_DB_URL" ] && echo "SUPABASE_DB_URL is empty" && exit 1 || echo "SUPABASE_DB_URL OK"
+          [ -z "$SUPABASE_POOLED_URL" ] && echo "SUPABASE_POOLED_URL is empty" && exit 1 || echo "SUPABASE_POOLED_URL OK"
+
+      # 1) Делаем дамп с Railway (custom формат)
+      - name: Dump from Railway
+        env:
+          RAILWAY_DB_URL: ${{ secrets.RAILWAY_DB_URL }}
+        run: |
+          set -euxo pipefail
+          mkdir -p dumps
+          docker run --rm -v "$PWD/dumps:/dumps" postgres:16 \
+            pg_dump --dbname="$RAILWAY_DB_URL" \
+                    --format=custom --no-owner --no-privileges \
+                    --quote-all-identifiers \
+                    --file=/dumps/railway.dump
+          ls -lh dumps/railway.dump
+
+      # 2) Конвертим дамп в обычный SQL, чтобы грузить через pooler (IPv4)
+      - name: Convert dump → plain SQL
+        run: |
+          set -euxo pipefail
+          docker run --rm -v "$PWD/dumps:/dumps" postgres:16 \
+            pg_restore -f /dumps/export.sql /dumps/railway.dump
+          # На всякий случай подчистим возможные \meta-команды psql
+          sed -i 's/\r$//' dumps/export.sql || true
+          sed -i '/^\\/d' dumps/export.sql || true
+          head -n 20 dumps/export.sql
+          ls -lh dumps/export.sql
+
+      # 3) Создаём базовые расширения (идемпотентно) через pooled (IPv4)
+      - name: Ensure common extensions (via pooled)
+        env:
+          SUPABASE_POOLED_URL: ${{ secrets.SUPABASE_POOLED_URL }}
+        run: |
+          set -euxo pipefail
+          docker run --rm -e SUPABASE_POOLED_URL="$SUPABASE_POOLED_URL" postgres:16 \
+            psql "$SUPABASE_POOLED_URL" -v ON_ERROR_STOP=0 -c \
+            "create extension if not exists pgcrypto;
+             create extension if not exists \"uuid-ossp\";
+             create extension if not exists citext;
+             create extension if not exists pg_trgm;"
+
+      # 4) Заливаем SQL в Supabase через pooled (IPv4)
+      - name: Restore to Supabase (via pooled)
+        env:
+          SUPABASE_POOLED_URL: ${{ secrets.SUPABASE_POOLED_URL }}
+        run: |
+          set -euxo pipefail
+          docker run --rm -e SUPABASE_POOLED_URL="$SUPABASE_POOLED_URL" -v "$PWD/dumps:/dumps" postgres:16 \
+            bash -lc 'psql "$SUPABASE_POOLED_URL" -v ON_ERROR_STOP=1 -f /dumps/export.sql'
