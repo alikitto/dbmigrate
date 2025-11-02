@@ -1,0 +1,57 @@
+name: Migrate Railwayw → Supabase
+on: workflow_dispatch
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check secrets
+        run: |
+          for v in RAILWAY_DB_URL SUPABASE_DB_URL SUPABASE_POOLED_URL; do
+            [ -z "${{ secrets[$v] }}" ] && echo "$v is empty" && exit 1 || echo "$v OK";
+          done
+
+      - name: Dump from Railway (custom format)
+        env:
+          RAILWAY_DB_URL: ${{ secrets.RAILWAY_DB_URL }}
+        run: |
+          set -euxo pipefail
+          mkdir -p dumps
+          docker run --rm -v "$PWD/dumps:/dumps" postgres:16 \
+            pg_dump --dbname="$RAILWAY_DB_URL" \
+                    --format=custom --no-owner --no-privileges \
+                    --quote-all-identifiers \
+                    --file=/dumps/railway.dump
+          ls -lh dumps/railway.dump
+
+      - name: Convert dump → plain SQL (and clean psql metas)
+        run: |
+          set -euxo pipefail
+          docker run --rm -v "$PWD/dumps:/dumps" postgres:16 \
+            pg_restore -f /dumps/export.sql /dumps/railway.dump
+          # На всякий удалим строки-метакоманды \... если вдруг появятся
+          sed -i 's/\r$//' dumps/export.sql
+          sed -i '/^\\/d' dumps/export.sql
+          head -n 20 dumps/export.sql
+          ls -lh dumps/export.sql
+
+      - name: Create common extensions (idempotent) via pooled
+        env:
+          SUPABASE_POOLED_URL: ${{ secrets.SUPABASE_POOLED_URL }}
+        run: |
+          set -euxo pipefail
+          docker run --rm -e PGPASSWORD="" -v "$PWD/dumps:/dumps" postgres:16 \
+            bash -lc 'psql "$SUPABASE_POOLED_URL" -v ON_ERROR_STOP=0 -c "
+              create extension if not exists pgcrypto;
+              create extension if not exists \"uuid-ossp\";
+              create extension if not exists citext;
+              create extension if not exists pg_trgm;
+            "'
+
+      - name: Restore to Supabase via pooled (psql)
+        env:
+          SUPABASE_POOLED_URL: ${{ secrets.SUPABASE_POOLED_URL }}
+        run: |
+          set -euxo pipefail
+          docker run --rm -v "$PWD/dumps:/dumps" postgres:16 \
+            bash -lc 'psql "$SUPABASE_POOLED_URL" -v ON_ERROR_STOP=1 -f /dumps/export.sql'
