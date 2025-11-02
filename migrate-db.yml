@@ -1,0 +1,30 @@
+name: Migrate Railway → Supabase
+on: workflow_dispatch
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show pg versions
+        run: docker run --rm postgres:16 psql --version
+
+      - name: Dump from Railway
+        env:
+          RAILWAY_DB_URL: ${{ secrets.RAILWAY_DB_URL }}
+        run: |
+          mkdir -p dumps
+          docker run --rm -v "$PWD/dumps:/dumps" postgres:16 \
+            pg_dump --dbname="$RAILWAY_DB_URL" \
+                    --format=custom --no-owner --no-privileges \
+                    --quote-all-identifiers \
+                    --file=/dumps/railway.dump
+          ls -lh dumps
+
+      - name: Restore to Supabase (Direct)
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          docker run --rm -v "$PWD/dumps:/dumps" postgres:16 \
+            pg_restore --dbname="$SUPABASE_DB_URL" \
+                       --no-owner --no-privileges --jobs=4 \
+                       /dumps/railway.dump
