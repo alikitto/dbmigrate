@@ -1,0 +1,47 @@
+      # Truncate public.* (чтобы не было дублей)
+      - name: Truncate target tables before load (avoid duplicates)
+        env:
+          SUPABASE_POOLED_URL: ${{ secrets.SUPABASE_POOLED_URL }}
+        run: |
+          set -euxo pipefail
+          docker run --rm -e SUPABASE_POOLED_URL="$SUPABASE_POOLED_URL" postgres:16 \
+            bash -lc "cat <<'SQL' | psql \"$SUPABASE_POOLED_URL\" -v ON_ERROR_STOP=1
+          DO $$
+          DECLARE r record;
+          BEGIN
+            FOR r IN
+              SELECT schemaname, tablename
+              FROM pg_tables
+              WHERE schemaname = 'public'
+            LOOP
+              EXECUTE format('TRUNCATE TABLE %I.%I RESTART IDENTITY CASCADE', r.schemaname, r.tablename);
+            END LOOP;
+          END $$;
+          SQL"
+
+      # Поднимаем sequence-ы после импорта
+      - name: Fix sequences after import
+        env:
+          SUPABASE_POOLED_URL: ${{ secrets.SUPABASE_POOLED_URL }}
+        run: |
+          set -euxo pipefail
+          docker run --rm -e SUPABASE_POOLED_URL="$SUPABASE_POOLED_URL" postgres:16 \
+            bash -lc "cat <<'SQL' | psql \"$SUPABASE_POOLED_URL\" -v ON_ERROR_STOP=1
+          DO $$
+          DECLARE r record;
+          BEGIN
+            FOR r IN
+              SELECT
+                pg_get_serial_sequence(quote_ident(n.nspname)||'.'||quote_ident(c.relname), a.attname) AS seq,
+                quote_ident(n.nspname)||'.'||quote_ident(c.relname) AS fq_tbl,
+                a.attname AS col
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0
+              JOIN pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum
+              WHERE c.relkind = 'r' AND n.nspname = 'public' AND d.adsrc LIKE 'nextval(%'
+            LOOP
+              EXECUTE format('SELECT setval(%L, COALESCE((SELECT max(%I) FROM %s), 1), true)', r.seq, r.col, r.fq_tbl);
+            END LOOP;
+          END $$;
+          SQL"
